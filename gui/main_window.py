@@ -1,26 +1,49 @@
 import os
 import sys
 import subprocess
-import matplotlib
-import matplotlib.pyplot as plt
-matplotlib.use('Qt5Agg')
-import pandas as pd
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 import shutil
-from qgis.gui import QgsProjectionSelectionDialog
+import http.server
+import socketserver
+import threading
+from qgis.gui import QgsProjectionSelectionDialog, QgsScaleWidget
 from qgis.PyQt import QtWidgets, QtGui, QtCore
 
+try:
+    import matplotlib
+    import pandas as pd
+    
+    # Automatyczne wykrywanie backendu (Qt6 dla nowego QGIS, Qt5 dla starego)
+    try:
+        # Próbujemy załadować backend Qt6 (qtagg)
+        import PyQt6
+        matplotlib.use('qtagg') 
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    except ImportError:
+        # Jeśli nie ma Qt6, próbujemy Qt5
+        matplotlib.use('Qt5Agg') 
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    
+    HAS_PLOTS = True
+except Exception as e:
+    print(f"Błąd ładowania wykresów: {e}")
+    HAS_PLOTS = False
+    FigureCanvas = None
+    
 # --- IMPORTY QGIS ---
 from qgis.core import (
     QgsProject, 
     QgsVectorLayer, 
     QgsRasterLayer, 
     QgsLayerTreeModel, 
+    QgsVectorFileWriter,
     QgsPointCloudLayer,
     QgsCoordinateReferenceSystem, 
     QgsCoordinateTransform,
-    QgsDataSourceUri
+    QgsDataSourceUri,
+    QgsRectangle
 )
 from qgis.gui import QgsMapCanvas, QgsLayerTreeMapCanvasBridge, QgsLayerTreeView
 HAS_3D = False
@@ -59,7 +82,8 @@ try:
         compute_slope_raster, vector_buffer, generate_contours,
         compute_aspect_raster, compute_hillshade_raster, 
         clip_vector_geopandas, centroids_geopandas,
-        pdal_generate_dsm, pdal_generate_dtm, pdal_info
+        pdal_generate_dsm, pdal_generate_dtm, pdal_info,
+        extract_by_attribute, validate_geometry
     )
 except ImportError:
     compute_slope_raster = vector_buffer = generate_contours = None
@@ -101,6 +125,13 @@ try:
     from core.ows_client import OWSClient
 except ImportError:
     OWSClient = None
+try: 
+    from core.web_map import WebMapGenerator
+    HAS_FOLIUM = True
+except ImportError:
+    HAS_FOLIUM = False
+    WebMapGenerator = None
+
 APP_TITLE = "Projekt inżynierski na potrzeby pracy dyplomowej"
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -183,16 +214,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_raster_layer = None
         self.last_vector_layer = None
         self.last_point_cloud_layer = None
-
+        self.status = self.statusBar()
+        self.server_thread = None # <--- NOWOŚĆ: Uchwyt do wątku serwera
+        self.httpd = None         # <--- NOWOŚĆ: Uchwyt do serwera
+        if self.db:
+            self.db.connect()
+        self.scale_widget = QgsScaleWidget(self)
+        self.scale_widget.setMapCanvas(self.canvas)
+        self.scale_widget.setShowCurrentScaleButton(True)
+        self.scale_widget.scaleChanged.connect(self.canvas.zoomScale)
+        self.status.addPermanentWidget(self.scale_widget)
+        self.start_local_web_server()
+            
         self.load_default_basemap()
 
     # --- BUILDERS ---
+    # --- NOWA METODA POMOCNICZA ---
     def get_target_layer(self, layer_type):
         """
         Zwraca warstwę do analizy.
         Priorytet 1: Warstwa zaznaczona myszką w drzewku.
         Priorytet 2: Ostatnio wczytana warstwa (fallback).
         """
+        # 1. Sprawdź co jest zaznaczone w legendzie
         idxs = self.layer_tree_view.selectionModel().selectedRows()
         if idxs:
             node = self.layer_tree_view.index2node(idxs[0])
@@ -202,15 +246,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 if isinstance(layer, layer_type):
                     return layer
         
-        # 2. Jeśli nic nie zaznaczono, weź ostatnią dodaną
+        # 2. Jeśli nic nie zaznaczono, weź ostatnią dodaną (stara logika)
         if layer_type == QgsRasterLayer: return self.last_raster_layer
         if layer_type == QgsVectorLayer: return self.last_vector_layer
         if layer_type == QgsPointCloudLayer: return self.last_point_cloud_layer
         
         return None
+        
+        return None
     def _build_tab_data(self):
         layout = QtWidgets.QVBoxLayout(self.tab_data)
         layout.setAlignment(QtCore.Qt.AlignTop)
+        btn_base = QtWidgets.QPushButton("🗺️ Zmień Podkład Mapowy")
+        btn_base.clicked.connect(self.change_basemap_action)
+        btn_base.setStyleSheet("background-color: #e1e1e1; font-weight: bold;")
+        layout.addWidget(btn_base)
+        layout.addSpacing(10)
         layout.addWidget(QtWidgets.QLabel("<b>Wczytaj dane:</b>"))
         btn_vec = QtWidgets.QPushButton("📥 Wczytaj wektor")
         btn_vec.clicked.connect(self.load_vector_action)
@@ -265,7 +316,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
         l.addSpacing(10); l.addWidget(QtWidgets.QLabel("<b>Wektor (OGR/Pandas):</b>"))
         for t, f in [("⭕ Bufor", self.compute_buffer_action), ("✂️ Przytnij", self.clip_vector_action),
-                     ("📍 Centroidy", self.compute_centroids_action)]:
+                     ("📍 Centroidy", self.compute_centroids_action), ("🔍 Wyodrębnij obiekt (Filtr)", self.extract_feature_action)]:
             b = QtWidgets.QPushButton(t); b.clicked.connect(f); l.addWidget(b)
 
         l.addSpacing(10); l.addWidget(QtWidgets.QLabel("<b>LiDAR (PDAL):</b>"))
@@ -296,36 +347,103 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_tab_publish(self):
         layout = QtWidgets.QVBoxLayout(self.tab_publish)
         layout.setAlignment(QtCore.Qt.AlignTop)
+        
+        # Sekcja PDF
+        layout.addWidget(QtWidgets.QLabel("<b>Eksport Statyczny:</b>"))
         btn_pdf = QtWidgets.QPushButton("📄 Eksport PDF")
         btn_pdf.clicked.connect(self.export_pdf_action)
+        layout.addWidget(btn_pdf)
+        
+        layout.addSpacing(15)
+        
+        # Sekcja WebGIS (Rozdzielona)
+        layout.addWidget(QtWidgets.QLabel("<b>Eksport Interaktywny (Web):</b>"))
+        
+        # Przycisk 1: Generowanie (Ciężka praca)
+        btn_update_web = QtWidgets.QPushButton("🔄 Aktualizuj treść mapy (HTML)")
+        btn_update_web.clicked.connect(self.update_web_map_content_action)
+        btn_update_web.setStyleSheet("background-color: #ffaa00; font-weight: bold;") # Wyróżniamy go
+        layout.addWidget(btn_update_web)
+        
+        # Przycisk 2: Otwieranie (Tylko link)
+        btn_open_web = QtWidgets.QPushButton("🌍 Otwórz w przeglądarce")
+        btn_open_web.clicked.connect(self.open_web_map_url_action)
+        layout.addWidget(btn_open_web)
+        
+        layout.addSpacing(15)
+        
+        # Sekcja GeoServer
+        layout.addWidget(QtWidgets.QLabel("<b>Serwer OGC:</b>"))
         btn_gs = QtWidgets.QPushButton("🌐 Publikuj GeoServer")
         btn_gs.clicked.connect(self.publish_current_postgis_layer_action)
-        layout.addWidget(btn_pdf)
         layout.addWidget(btn_gs)
     def _build_tab_benchmark(self):
-        layout = QtWidgets.QVBoxLayout(self.tab_benchmark)
-        
-        # Panel sterowania
+        l = QtWidgets.QVBoxLayout(self.tab_benchmark)
         ctrl = QtWidgets.QHBoxLayout()
-        self.combo_test_type = QtWidgets.QComboBox()
-        self.combo_test_type.addItems(["1. Porównanie Silników (Bar Chart)", "2. Porównanie Formatów (Bar Chart)", "3. Skalowalność (Line Chart)"])
         
-        btn = QtWidgets.QPushButton("🚀 Uruchom Test")
-        btn.clicked.connect(self.run_benchmark_action)
+        self.combo_test = QtWidgets.QComboBox()
+        self.combo_test.addItems([
+            "1. I/O Odczyt (Wektor)", "2. Geometria - Bufor", "3. Topologia - Spatial Join",
+            "4. Projekcje - Transformacja", "5. Atrybuty - Filtrowanie", "6. Iteracja vs Wektoryzacja",
+            "7. Raster - Resampling", "8. Raster - Algebra", "9. Raster - Statystyki",
+            "10. DB - Import", "11. DB - Eksport", 
+            "12. LiDAR - Info", "13. LiDAR - Filtracja"
+        ])
         
-        ctrl.addWidget(QtWidgets.QLabel("Wybierz test:"))
-        ctrl.addWidget(self.combo_test_type)
+        self.spin_iter = QtWidgets.QSpinBox(); self.spin_iter.setRange(1,10); self.spin_iter.setValue(3)
+        
+        # --- NOWE: Przełącznik Metryki ---
+        self.combo_metric = QtWidgets.QComboBox()
+        self.combo_metric.addItems(["Czas [s]", "RAM [MB]"])
+        # ---------------------------------
+
+        btn = QtWidgets.QPushButton("🚀 Test"); btn.clicked.connect(self.run_benchmark_action)
+        
+        ctrl.addWidget(QtWidgets.QLabel("Test:")); ctrl.addWidget(self.combo_test)
+        ctrl.addWidget(QtWidgets.QLabel("Metryka:")); ctrl.addWidget(self.combo_metric)
+        ctrl.addWidget(QtWidgets.QLabel("Powt.:")); ctrl.addWidget(self.spin_iter)
         ctrl.addWidget(btn)
-        layout.addLayout(ctrl)
+        l.addLayout(ctrl)
         
-        # Wykres
-        self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.chart_canvas = FigureCanvas(self.fig)
-        layout.addWidget(self.chart_canvas)
+        if HAS_PLOTS:
+            self.fig = Figure(figsize=(5,4), dpi=100); self.chart_canvas = FigureCanvas(self.fig); l.addWidget(self.chart_canvas)
+        else: l.addWidget(QtWidgets.QLabel("Brak matplotlib."))
         
-        # Tabela
-        self.res_table = QtWidgets.QTableWidget()
-        layout.addWidget(self.res_table)
+        self.res_table = QtWidgets.QTableWidget(); l.addWidget(self.res_table)
+        self.txt_bench_results = QtWidgets.QTextEdit(); self.txt_bench_results.setMaximumHeight(100); l.addWidget(self.txt_bench_results)
+
+    def update_benchmark_charts(self, data):
+        if not data or not HAS_PLOTS: return
+        typ, df = data
+        if df is None or df.empty: self.txt_bench_results.append("Brak danych."); return
+        
+        # Tabela (pokazuje wszystko)
+        self.res_table.setRowCount(len(df)); self.res_table.setColumnCount(len(df.columns))
+        self.res_table.setHorizontalHeaderLabels(df.columns)
+        for i, row in df.iterrows():
+            for j, val in enumerate(row): 
+                t = f"{val:.4f}" if isinstance(val, (int, float)) else str(val)
+                self.res_table.setItem(i, j, QtWidgets.QTableWidgetItem(t))
+        
+        # Wykres (zależny od wyboru użytkownika)
+        metric = self.combo_metric.currentText() # "Czas [s]" lub "RAM [MB]"
+        
+        self.fig.clear(); ax = self.fig.add_subplot(111)
+        
+        # Kolory: Niebieski dla czasu, Czerwony dla RAMu
+        bar_color = '#4e79a7' if "Czas" in metric else '#e15759'
+        
+        if "Nazwa" in df.columns and metric in df.columns:
+            bars = ax.bar(df["Nazwa"], df[metric], color=bar_color)
+            ax.set_ylabel(metric)
+            ax.set_title(f"Porównanie: {metric}")
+            ax.bar_label(bars, fmt='%.2f')
+        
+        elif "Liczba Obiektów" in df.columns: # Skalowalność
+            ax.plot(df["Liczba Obiektów"], df["Czas [s]"], marker='o')
+
+        self.chart_canvas.draw()
+        self.txt_bench_results.append("Zakończono.")
     def _build_tab_terminal(self):
         layout = QtWidgets.QVBoxLayout(self.tab_terminal)
         self.term_output = QtWidgets.QTextEdit()
@@ -388,115 +506,252 @@ class MainWindow(QtWidgets.QMainWindow):
             self.term_output.append(f"CRITICAL ERROR: {str(e)}")
 
     # --- LOGIKA WARSTW ---
+    def start_local_web_server(self):
+        """Uruchamia prosty serwer HTTP w tle dla folderu z danymi."""
+        if self.server_thread: return # Już działa
+
+        PORT = 8000
+        DIRECTORY = self.data_dir
+        
+        def run_server():
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory=DIRECTORY, **kwargs)
+                # Wyłączamy logowanie do konsoli, żeby nie śmiecić
+                def log_message(self, format, *args): pass
+
+            try:
+                # Allow_reuse_address pozwala na szybki restart portu
+                socketserver.TCPServer.allow_reuse_address = True
+                with socketserver.TCPServer(("", PORT), Handler) as httpd:
+                    self.httpd = httpd
+                    print(f"WEB SERVER: Działa na http://localhost:{PORT}")
+                    print(f"WEB ROOT: {DIRECTORY}")
+                    httpd.serve_forever()
+            except OSError as e:
+                print(f"WEB SERVER ERROR: Port {PORT} zajęty? {e}")
+                
+        self.server_thread = threading.Thread(target=run_server, daemon=True)
+        self.server_thread.start()
     def run_benchmark_action(self):
-        if not self.last_vector_layer:
-            QtWidgets.QMessageBox.warning(self, "Info", "Wczytaj warstwę wektorową.")
-            return
-            
-        if not Benchmarker: # Sprawdza czy moduł załadowany
-             QtWidgets.QMessageBox.critical(self, "Błąd", "Moduł Benchmark nieaktywny.")
-             return
-
-        test_idx = self.combo_test_type.currentIndex()
-        src = self.last_vector_layer.source().split("|")[0]
+        if not PerformanceTester: return
         
-        # Conn string
-        conn = None
-        if self.db: conn = f"postgresql://{PG_USER}:{PG_PASS}@localhost:5432/{PG_DB}"
+        test_idx = self.combo_test.currentIndex() # 0-based index (0 = Test 1)
+        iters = self.spin_iter.value()
+        
+        # Detekcja warstwy
+        target_layer = None
+        
+        # Wektory: 0,1,2,3,4,5,9,10
+        if test_idx in [0, 1, 2, 3, 4, 5, 9, 10]:
+            target_layer = self.get_target_layer(QgsVectorLayer)
+            if not target_layer: QtWidgets.QMessageBox.warning(self, "Info", "Wymagany Wektor."); return
+            
+        # Rastry: 6,7,8
+        elif test_idx in [6, 7, 8]:
+            target_layer = self.get_target_layer(QgsRasterLayer)
+            if not target_layer: QtWidgets.QMessageBox.warning(self, "Info", "Wymagany Raster."); return
+            
+        # LiDAR: 11,12
+        elif test_idx in [11, 12]:
+            target_layer = self.get_target_layer(QgsPointCloudLayer)
+            if not target_layer: QtWidgets.QMessageBox.warning(self, "Info", "Wymagana Chmura (LAS)."); return
 
-        # Definicja zadania w tle
+        src = target_layer.source().split("|")[0]
+        self.txt_bench_results.append(f"🚀 Start testu {test_idx+1}: {os.path.basename(src)}...")
+        QtWidgets.QApplication.processEvents()
+        
+        conn = self.db.conn_string if self.db else None
+
         def run_test():
-            from core.analytics import PerformanceTester # Lokalny import
-            tester = PerformanceTester(conn)
+            t = PerformanceTester(conn)
             
-            if test_idx == 0:
-                return "engine", tester.run_engine_benchmark(src)
-            elif test_idx == 1:
-                return "format", tester.run_format_benchmark(src)
-            elif test_idx == 2:
-                return "scale", tester.run_scalability_test(src)
-        
+            if test_idx == 0: return "bar", t.bench_vector_io_read(src)
+            elif test_idx == 1: return "bar", t.bench_vector_buffer(src)
+            elif test_idx == 2: return "bar", t.bench_vector_spatial_join(src)
+            elif test_idx == 3: return "bar", t.bench_vector_reprojection(src)
+            elif test_idx == 4: return "bar", t.bench_vector_attribute_filter(src)
+            elif test_idx == 5: return "bar", t.bench_vector_iteration(src)
+            
+            elif test_idx == 6: return "bar", t.bench_raster_resample(src)
+            elif test_idx == 7: return "bar", t.bench_raster_slope(src)
+            elif test_idx == 8: return "bar", t.bench_raster_stats(src)
+            
+            elif test_idx == 9: return "bar", t.bench_db_import(src)
+            elif test_idx == 10: return "bar", t.bench_db_export(src)
+            
+            elif test_idx == 11: return "bar", t.bench_lidar_info(src)
+            elif test_idx == 12: return "bar", t.bench_lidar_filter(src)
+            
         self.start_worker(run_test, result_callback=self.update_benchmark_charts)
 
     def update_benchmark_charts(self, data):
-        test_type, df = data
-        if df is None or df.empty: return
+        if not data or not HAS_PLOTS: return
+        typ, df = data
+        if df is None or df.empty: 
+            self.txt_bench_results.append("Brak danych do wykresu.")
+            return
         
-        # 1. Tabela
+        # 1. Aktualizacja Tabeli
         self.res_table.setRowCount(len(df))
         self.res_table.setColumnCount(len(df.columns))
         self.res_table.setHorizontalHeaderLabels(df.columns)
         for i, row in df.iterrows():
             for j, val in enumerate(row):
-                self.res_table.setItem(i, j, QtWidgets.QTableWidgetItem(str(val)))
-
-        # 2. Wykres
+                # Ładne formatowanie liczb
+                txt = f"{val:.4f}" if isinstance(val, (float, int)) and not isinstance(val, bool) else str(val)
+                self.res_table.setItem(i, j, QtWidgets.QTableWidgetItem(txt))
+        
+        # 2. Aktualizacja Wykresu
         self.fig.clear()
         ax = self.fig.add_subplot(111)
         
-        if test_type == "engine":
-            ax.bar(df["Nazwa"], df["Czas [s]"], color=['#4c72b0', '#55a868', '#c44e52'])
-            ax.set_title("Wydajność Silników (Buforowanie)")
-            ax.set_ylabel("Czas [s]")
+        # Kolory dla wykresów
+        colors = ['#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f']
+
+        # --- LOGIKA RYSOWANIA ---
+        # Obsługujemy uniwersalny typ "bar" wysyłany przez nowe testy
+        
+        if typ == "bar" or typ == "engine" or typ == "format":
+            # Wykres słupkowy
+            # Zakładamy, że 1. kolumna to Nazwa, 2. to Czas
+            x_col = df.columns[0]
+            y_col = df.columns[1]
             
-        elif test_type == "format":
-            ax.barh(df["Nazwa"], df["Czas [s]"], color='#8172b3')
-            ax.set_title("Czas Odczytu Formatów")
-            ax.set_xlabel("Czas [s]")
+            bars = ax.bar(df[x_col], df[y_col], color=colors[:len(df)])
             
-        elif test_type == "scale":
-            ax.plot(df["Liczba Obiektów"], df["Czas [s]"], marker='o', linestyle='-', color='#c44e52')
-            ax.set_title("Skalowalność (Czas vs Ilość danych)")
-            ax.set_xlabel("Liczba obiektów")
-            ax.set_ylabel("Czas obliczeń [s]")
+            ax.set_ylabel(y_col)
+            ax.set_title(f"Wyniki: {x_col} vs {y_col}")
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Dodanie etykiet z wartościami nad słupkami
+            try:
+                ax.bar_label(bars, fmt='%.3f')
+            except: pass # Starsze wersje matplotlib tego nie mają
+
+        elif typ == "scale" or typ == "line":
+            # Wykres liniowy (dla skalowalności)
+            x_col = df.columns[0]
+            y_col = df.columns[1]
+            
+            ax.plot(df[x_col], df[y_col], marker='o', linestyle='-', color='#e15759', linewidth=2)
+            ax.set_xlabel(x_col)
+            ax.set_ylabel(y_col)
+            ax.set_title("Test Skalowalności")
             ax.grid(True)
 
         self.fig.tight_layout()
         self.chart_canvas.draw()
+        
+        self.txt_bench_results.append("✅ Wykres zaktualizowany.")
     def add_layer_smart(self, layer):
-        if not layer.isValid(): return False
+        """Dodaje warstwę i bezpiecznie ustawia widok."""
+        if not layer.isValid():
+            print("Błąd: Warstwa niepoprawna (isValid=False)")
+            return False
         
-        # --- FIX DLA LIDAR (LAS) ---
-        # Jeśli to chmura, ZAWSZE ustawiamy PUWG 1992 (EPSG:2180)
-        if isinstance(layer, QgsPointCloudLayer):
+        # Fix dla LiDAR
+        if isinstance(layer, QgsPointCloudLayer) and not layer.crs().isValid():
             layer.setCrs(QgsCoordinateReferenceSystem("EPSG:2180"))
-        
+
+        # Dodanie do projektu (To powinno sprawić, że pojawi się w legendzie)
         self.project.addMapLayer(layer)
         
+        # Aktualizacja stanu
         if isinstance(layer, QgsRasterLayer): self.last_raster_layer = layer
         elif isinstance(layer, QgsVectorLayer): self.last_vector_layer = layer
         elif isinstance(layer, QgsPointCloudLayer): self.last_point_cloud_layer = layer
 
-        # Zoom
+        # Próba Zoomu (zabezpieczona)
         try:
-            tc = self.canvas.mapSettings().destinationCrs()
-            # Jeśli warstwa jest w 2180, a mapa w 3857, musimy przeliczyć zasięg
-            if layer.crs() != tc:
-                tr = QgsCoordinateTransform(layer.crs(), tc, self.project)
-                ext = tr.transformBoundingBox(layer.extent())
-                if ext.isFinite(): 
-                    self.canvas.setExtent(ext)
-                else:
-                    self.canvas.zoomToFullExtent()
+            # Jeśli warstwa jest WFS, jej extent może być pusty na początku
+            extent = layer.extent()
+            
+            # Sprawdzamy czy extent jest poprawny matematycznie
+            if extent.isEmpty() or not extent.isFinite():
+                # Nie robimy zoomu, zostawiamy widok tam gdzie jest (użytkownik musi sam przybliżyć)
+                print("Info: Warstwa ma pusty zasięg (WFS?), pomijam auto-zoom.")
             else:
-                self.canvas.setExtent(layer.extent())
-        except: 
-            self.canvas.zoomToFullExtent()
-        
+                # Standardowy zoom z transformacją
+                tc = self.canvas.mapSettings().destinationCrs()
+                if layer.crs() != tc:
+                    tr = QgsCoordinateTransform(layer.crs(), tc, self.project)
+                    ext = tr.transformBoundingBox(extent)
+                    if ext.isFinite(): self.canvas.setExtent(ext)
+                else:
+                    self.canvas.setExtent(extent)
+        except Exception as e:
+            print(f"Błąd zoomu: {e}")
+            # Nie robimy nic, żeby nie zepsuć widoku
+
         self.canvas.refresh()
         return True
 
     def load_default_basemap(self):
+        """Ładuje podkład OpenStreetMap i ustawia widok na Polskę."""
         uri = "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0"
         osm = QgsRasterLayer(uri, "OpenStreetMap", "wms")
+        
         if osm.isValid():
             self.project.addMapLayer(osm)
+            
+            # --- USTAWIENIE WIDOKU NA POLSKĘ (EPSG:3857) ---
+            # Współrzędne: xMin, yMin, xMax, yMax (w metrach Mercatora)
+            poland_extent = QgsRectangle(1500000, 6250000, 2700000, 7450000)
+            self.canvas.setExtent(poland_extent)
+            # -----------------------------------------------
+            
             self.canvas.refresh()
+        else:
+            print("Błąd: Nie udało się pobrać podkładu mapowego")
+    def change_basemap_action(self):
+        """Pozwala wybrać jeden z popularnych podkładów mapowych."""
+        
+        # Słownik dostępnych map (Nazwa : URI)
+        # type=xyz oznacza kafelki (szybkie), context... to WMS (Geoportal)
+        maps = {
+            "OpenStreetMap (Standard)": "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0",
+            
+            "Google Hybrid (Satelita + Drogi)": "type=xyz&url=https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+            
+            "Google Satellite (Czysty)": "type=xyz&url=https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+            
+            "Esri Satellite (ArcGIS)": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            
+            "Esri Topo (Topograficzna)": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+            
+            "CartoDB Dark (Do analiz)": "type=xyz&url=https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+            
+            "Geoportal Ortofotomapa (PL)": "contextualWMSLegend=0&crs=EPSG:2180&dpiMode=7&featureCount=10&format=image/jpeg&layers=Raster&styles=&url=https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/StandardResolution"
+        }
 
+        item, ok = QtWidgets.QInputDialog.getItem(self, "Podkład", "Wybierz mapę bazową:", list(maps.keys()), 0, False)
+        
+        if ok and item:
+            uri = maps[item]
+            name = item.split(" (")[0] # Skracamy nazwę do legendy
+            
+            # Tworzenie warstwy
+            # Dla XYZ i WMS provider to zawsze "wms" w QGIS
+            layer = QgsRasterLayer(uri, name, "wms")
+            
+            if layer.isValid():
+                self.project.addMapLayer(layer)
+                
+                # Przesuwamy warstwę na sam dół (żeby nie zasłoniła Twoich danych)
+                root = self.project.layerTreeRoot()
+                node = root.findLayer(layer.id())
+                clone = node.clone()
+                root.addChildNode(clone)
+                root.removeChildNode(node)
+                
+                self.status.showMessage(f"Wczytano podkład: {name}", 3000)
+            else:
+                QtWidgets.QMessageBox.warning(self, "Błąd", "Nie udało się wczytać podkładu (sprawdź internet).")
     # --- AKCJE DANYCH ---
 
     def load_vector_action(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Otwórz", self.data_dir, "Wektor (*.shp *.gpkg *.geojson)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Otwórz", self.data_dir, "Wektor (*.shp *.gpkg *.geojson *.gml)")
         if path:
             l = QgsVectorLayer(path, os.path.basename(path), "ogr")
             self.add_layer_smart(l)
@@ -586,43 +841,77 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_worker(fetch_layers, result_callback=on_layers_fetched)
 
     def load_wfs_action(self):
-        """
-        Analogicznie dla WFS (Wektory).
-        """
-        if not OWSClient: return
+        if not OWSClient: 
+            QtWidgets.QMessageBox.critical(self, "Błąd", "Brak modułu OWSClient.")
+            return
 
-        # Przykładowy URL (Geoportal - Państwowy Rejestr Granic)
-        default_url = "https://mapy.geoportal.gov.pl/wss/service/PZGIK/PRG/WFS/Granice"
-        url, ok = QtWidgets.QInputDialog.getText(self, "WFS", "Podaj adres URL usługi WFS:", text=default_url)
+        # Domyślny URL (iKERG Kalisz)
+        default_url = "https://ikerg.um.kalisz.pl/kalisz-egib"
+        url_input, ok = QtWidgets.QInputDialog.getText(self, "WFS", "Adres usługi WFS:", text=default_url)
         
-        if not ok or not url: return
+        if not ok or not url_input: return
 
-        def fetch_layers():
-            return OWSClient.get_wfs_layers(url)
+        # 1. Czyszczenie URL (usuwamy ?request=...)
+        base_url = url_input.split("?")[0]
 
-        def on_layers_fetched(layers):
+        # 2. Pobieranie listy w tle
+        def fetch(): 
+            return OWSClient.get_wfs_layers(base_url)
+        
+        def done(layers):
             if not layers:
-                QtWidgets.QMessageBox.warning(self, "Info", "Brak warstw WFS.")
+                QtWidgets.QMessageBox.warning(self, "Info", "Nie znaleziono warstw (lub błąd sieci).")
                 return
             
-            display_list = [f"{title} ({name})" for name, title in layers]
-            item, ok = QtWidgets.QInputDialog.getItem(self, "Wybierz Warstwę", "Dostępne warstwy WFS:", display_list, 0, False)
+            # Wyświetl listę: Tytuł (Nazwa_Techniczna)
+            display_list = [f"{t} ({n})" for n, t in layers]
+            item, ok = QtWidgets.QInputDialog.getItem(self, "Wybierz Warstwę", "Dostępne warstwy:", display_list, 0, False)
             
             if ok and item:
                 idx = display_list.index(item)
-                layer_name = layers[idx][0]
+                layer_name = layers[idx][0] # To jest 'typename' (np. 'egib:dzialki')
                 layer_title = layers[idx][1]
                 
-                # URI dla WFS jest prostsze
-                uri = f"{url}?service=WFS&version=1.0.0&request=GetFeature&typename={layer_name}"
+                # --- PROFESJONALNA KONSTRUKCJA URI ---
+                # Używamy klasy QgsDataSourceUri, która sformatuje to tak, jak robi to QGIS Desktop.
                 
-                # Ładujemy jako Wektor ("WFS")
-                vlayer = QgsVectorLayer(uri, layer_title, "WFS")
-                self.add_layer_smart(vlayer)
-                self.status.showMessage(f"Dodano WFS: {layer_title}", 5000)
+                uri = QgsDataSourceUri()
+                uri.setParam("url", base_url)
+                uri.setParam("typename", layer_name)
+                
+                # Wersja 1.0.0 jest najbezpieczniejsza dla polskich geoportali (unika problemu zamiany X/Y)
+                uri.setParam("version", "1.0.0") 
+                
+                # Wymuszenie układu 2180 (Kluczowe dla Polski)
+                uri.setParam("srsname", "EPSG:2180")
+                
+                # WAŻNE: Nie dodajemy pustych parametrów sql= ani table="", bo iKERG tego nie lubi!
+                
+                print(f"Próba ładowania WFS: {uri.uri()}")
+                
+                # Tworzenie warstwy
+                vlayer = QgsVectorLayer(uri.uri(), layer_title, "WFS")
+                
+                if self.add_layer_smart(vlayer):
+                    self.status.showMessage(f"Dodano WFS: {layer_title}", 5000)
+                    QtWidgets.QMessageBox.information(self, "Sukces", 
+                        f"Warstwa '{layer_title}' dodana.\n\n"
+                        "Jeśli jest pusta, przybliż mapę do obszaru Kalisza i przesuń widok.")
+                else:
+                    # Jeśli się nie uda, spróbujmy bez wymuszania wersji (niech QGIS negocjuje)
+                    print("Próba nr 2 (Auto-negocjacja)...")
+                    uri = QgsDataSourceUri()
+                    uri.setParam("url", base_url)
+                    uri.setParam("typename", layer_name)
+                    vlayer2 = QgsVectorLayer(uri.uri(), layer_title, "WFS")
+                    
+                    if self.add_layer_smart(vlayer2):
+                         self.status.showMessage(f"Dodano WFS (Auto): {layer_title}", 5000)
+                    else:
+                         QtWidgets.QMessageBox.warning(self, "Błąd", "Nie udało się załadować warstwy. Serwer może wymagać autoryzacji.")
 
-        self.status.showMessage("Pobieranie Capabilities serwera WFS...")
-        self.start_worker(fetch_layers, result_callback=on_layers_fetched)
+        self.status.showMessage("Pobieranie metadanych WFS...")
+        self.start_worker(fetch, result_callback=done)
     def rename_layer_action(self):
         idx = self.layer_tree_view.selectionModel().selectedRows()
         if idx:
@@ -708,7 +997,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if out:
             i, ok = QtWidgets.QInputDialog.getDouble(self, "Interwał", "Metry:", 10, 0.1, 10000, 2)
             if ok: self.start_worker(generate_contours, src, out, interval=i, result_path=out)
-
+    def validate_geometry_action(self):
+        l = self.get_target_layer(QgsVectorLayer)
+        if not l: 
+             QtWidgets.QMessageBox.warning(self, "Info", "Zaznacz warstwę wektorową.")
+             return
+        
+        src = l.source().split("|")[0]
+        
+        self.status.showMessage("Trwa walidacja topologii...", 0)
+        QtWidgets.QApplication.processEvents()
+        
+        # Uruchamiamy to synchronicznie (szybkie) lub w workerze
+        # Tu zrobimy prosto, bo chcemy wyświetlić tekst
+        from core.processing import validate_geometry # Local import for safety
+        report = validate_geometry(src)
+        
+        # Wyświetlamy raport w oknie
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Raport Walidacji")
+        dlg.resize(400, 300)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        text_edit = QtWidgets.QTextEdit()
+        text_edit.setPlainText(report)
+        text_edit.setReadOnly(True)
+        layout.addWidget(text_edit)
+        btn = QtWidgets.QPushButton("OK")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        
+        self.status.showMessage("Walidacja zakończona.", 5000)
+        dlg.exec()
     def compute_buffer_action(self):
         l = self.get_target_layer(QgsVectorLayer)
         if not l: 
@@ -739,6 +1058,43 @@ class MainWindow(QtWidgets.QMainWindow):
         s = l.source().split("|")[0]
         o, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Zapisz", "", "SHP (*.shp)")
         if o: self.start_worker(centroids_geopandas, s, o, result_path=o)
+    def extract_feature_action(self):
+        # 1. Pobierz warstwę wektorową
+        layer = self.get_target_layer(QgsVectorLayer)
+        if not layer: 
+            QtWidgets.QMessageBox.warning(self, "Info", "Zaznacz warstwę z dzielnicami.")
+            return
+        
+        # 2. Pobierz listę pól (kolumn)
+        fields = layer.fields()
+        field_names = [f.name() for f in fields]
+        
+        if not field_names:
+            QtWidgets.QMessageBox.warning(self, "Info", "Ta warstwa nie ma atrybutów.")
+            return
+
+        # 3. Zapytaj użytkownika o Kolumnę (np. "nazwa_dzielnicy")
+        col_name, ok = QtWidgets.QInputDialog.getItem(self, "Krok 1/2", "Wybierz kolumnę (atrybut):", field_names, 0, False)
+        if not ok: return
+        
+        # 4. Pobierz unikalne wartości z tej kolumny (żeby zrobić listę wyboru)
+        # Używamy indeksu pola
+        idx = fields.indexFromName(col_name)
+        unique_values = layer.uniqueValues(idx)
+        # Sortujemy i konwertujemy na napisy
+        values_str = sorted([str(v) for v in unique_values])
+        
+        # 5. Zapytaj użytkownika o Wartość (np. "Śródmieście")
+        val_str, ok = QtWidgets.QInputDialog.getItem(self, "Krok 2/2", f"Wybierz wartość z '{col_name}':", values_str, 0, False)
+        if not ok: return
+        
+        # 6. Wybierz plik zapisu
+        src = layer.source().split("|")[0]
+        out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Zapisz wynik", "", "SHP (*.shp);;GPKG (*.gpkg)")
+        
+        if out:
+            # Uruchom worker
+            self.start_worker(extract_by_attribute, src, out, column=col_name, value=val_str, result_path=out)
     
     # --- AKCJE PDAL (LiDAR) ---
 
@@ -844,45 +1200,44 @@ class MainWindow(QtWidgets.QMainWindow):
     # --- DB & EXPORT ---
 
     def connect_db_action(self):
-        if not PostGISConnector: 
-            QtWidgets.QMessageBox.critical(self, "Błąd", "Brak modułu DB.")
-            return
+        if not PostGISConnector: return
         
         # Domyślny string
         default_conn = f"postgresql://{PG_USER}:{PG_PASS}@localhost:5432/{PG_DB}"
         conn, ok = QtWidgets.QInputDialog.getText(self, "DB", "Conn String:", text=default_conn)
         
         if ok:
-            # Wyciągamy nazwę bazy z linku 
             try:
-                dbname = conn.rsplit("/", 1)[-1]
-            except:
-                dbname = "gismooth"
-
-            self.status.showMessage("Łączenie z bazą...", 0)
-            QtWidgets.QApplication.processEvents()
-
-            try:
-                # 1. Inicjalizacja obiektu (jeszcze bez łączenia)
+                # Wyciągamy nazwę bazy
+                try: dbname = conn.rsplit("/", 1)[-1]
+                except: dbname = "gismooth"
+                
+                self.status.showMessage(f"Łączenie z DB: {dbname}...", 0)
+                QtWidgets.QApplication.processEvents()
+                
                 self.db = PostGISConnector(conn)
-                
-                # Ta funkcja sprytnie podłączy się do 'postgres', stworzy bazę i się rozłączy.
+                # Upewniamy się, że baza istnieje
                 self.db.ensure_database(dbname)
-                
-                # 3. Teraz bezpiecznie łączymy się do naszej bazy
                 self.db.connect()
                 
-                # 4. Włączamy rozszerzenie przestrzenne (PostGIS)
-                self.db.enable_postgis()
+                # --- NOWOŚĆ: SPRAWDZANIE MOŻLIWOŚCI ---
+                caps = self.db.check_advanced_capabilities()
                 
-                self.lbl_db_status.setText("Status: POŁĄCZONO ✅")
+                status_msg = "Połączono z Bazą Danych!\n\nStatus modułów:"
+                status_msg += f"\n✅ Wektory (PostGIS): {'Dostępne' if caps['postgis'] else 'BŁĄD'}"
+                status_msg += f"\n{'✅' if caps['postgis_raster'] else '❌'} Rastry: {'Dostępne' if caps['postgis_raster'] else 'Brak (zainstaluj postgis_raster)'}"
+                status_msg += f"\n{'✅' if caps['pointcloud'] else '❌'} LiDAR: {'Dostępne' if caps['pointcloud'] else 'Brak (wymaga pgpointcloud)'}"
+                
+                self.lbl_db_status.setText("POŁĄCZONO ✅")
                 self.lbl_db_status.setStyleSheet("color: green; font-weight: bold;")
-                self.status.showMessage(f"Połączono z bazą: {dbname}", 5000)
+                
+                QtWidgets.QMessageBox.information(self, "Sukces", status_msg)
+                self.status.showMessage(f"Połączono: {dbname}", 5000)
                 
             except Exception as e:
-                self.lbl_db_status.setText("Status: BŁĄD ❌")
-                QtWidgets.QMessageBox.critical(self, "Błąd Bazy Danych", 
-                    f"Nie udało się połączyć lub utworzyć bazy.\n\nSzczegóły:\n{str(e)}")
+                self.lbl_db_status.setText("BŁĄD ❌")
+                self.lbl_db_status.setStyleSheet("color: red;")
+                QtWidgets.QMessageBox.critical(self, "Błąd", str(e))
                 self.status.clearMessage()
     def open_3d_viewer_action(self):
 
@@ -1008,7 +1363,121 @@ class MainWindow(QtWidgets.QMainWindow):
             out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "PDF", "", "PDF (*.pdf)")
             if out:
                 self.start_worker(export_map_to_pdf, self.project, self.canvas, out, title, author, crs_dlg.crs())
+    # --- AKCJE WEBGIS (ROZDZIELONE) ---
 
+    def update_web_map_content_action(self):
+        if not HAS_FOLIUM: return
+        
+        valid_layers = self.canvas.layers()[::-1]
+        if not valid_layers: 
+            QtWidgets.QMessageBox.warning(self, "Info", "Brak warstw.")
+            return
+
+        out_html = os.path.join(self.data_dir, "index.html")
+        # Folder cache do zrzucania WFS
+        cache_dir = os.path.join(self.data_dir, "web_cache")
+        if not os.path.exists(cache_dir): os.makedirs(cache_dir)
+
+        self.status.showMessage("Aktualizacja mapy...", 0)
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            web_gen = WebMapGenerator(self.data_dir)
+            colors = ['blue', 'green', 'red', 'purple', 'orange']
+            count = 0
+            
+            for i, layer in enumerate(valid_layers):
+                if not layer.isValid(): continue
+                name = layer.name()
+                provider = layer.providerType()
+                
+                # --- A. WMS ---
+                if provider == "wms":
+                    try:
+                        uri = QgsDataSourceUri(layer.source())
+                        url = uri.param("url")
+                        layers_id = uri.param("layers")
+                        fmt = uri.param("format") or "image/png"
+                        
+                        # Fallback parsowania
+                        if not url and "url=" in layer.source():
+                            url = layer.source().split("url=")[1].split("&")[0]
+                        if not layers_id and "layers=" in layer.source():
+                            layers_id = layer.source().split("layers=")[1].split("&")[0]
+
+                        if url and layers_id:
+                            if web_gen.add_wms_layer(url, layers_id, name, fmt):
+                                count += 1
+                    except: pass
+
+                # --- B. WEKTOR (PLIK LOKALNY) ---
+                elif isinstance(layer, QgsVectorLayer) and provider == "ogr":
+                    src_path = layer.source().split("|")[0]
+                    color = colors[i % len(colors)]
+                    if web_gen.add_vector_layer(src_path, name, color):
+                        count += 1
+
+                # --- C. WEKTOR (WFS) - NOWOŚĆ! ---
+                elif isinstance(layer, QgsVectorLayer) and provider.lower() == "wfs":
+                    try:
+                        self.status.showMessage(f"Pobieranie WFS: {name}...", 0)
+                        QtWidgets.QApplication.processEvents()
+                        
+                        # Zrzucamy WFS do pliku GeoJSON
+                        safe_name = "".join([c for c in name if c.isalnum()])
+                        temp_geojson = os.path.join(cache_dir, f"wfs_{safe_name}.geojson")
+                        
+                        # Usuń stary jeśli jest
+                        if os.path.exists(temp_geojson): os.remove(temp_geojson)
+                        
+                        # Zapisz warstwę do pliku
+                        err = QgsVectorFileWriter.writeAsVectorFormat(
+                            layer,
+                            temp_geojson,
+                            "UTF-8",
+                            QgsCoordinateReferenceSystem("EPSG:4326"), # Wymuszamy WGS84 dla WebMapy
+                            "GeoJSON"
+                        )
+                        
+                        if err[0] == QgsVectorFileWriter.NoError:
+                            color = colors[i % len(colors)]
+                            # Dodajemy nowo powstały plik
+                            if web_gen.add_vector_layer(temp_geojson, name, color):
+                                count += 1
+                        else:
+                            print(f"Błąd zapisu WFS: {err}")
+                    except Exception as e:
+                        print(f"Wyjątek WFS: {e}")
+
+                # --- D. RASTER (PLIK) ---
+                elif isinstance(layer, QgsRasterLayer) and provider == "gdal":
+                    src_path = layer.source().split("|")[0]
+                    if src_path.lower().endswith(('.tif', '.tiff', '.asc')):
+                        if web_gen.add_raster_layer(src_path, name):
+                            count += 1
+
+            if count > 0:
+                web_gen.save_map(out_html)
+                self.status.showMessage(f"Zaktualizowano {count} warstw.", 5000)
+            else:
+                QtWidgets.QMessageBox.warning(self, "Pusto", "Nie udało się wyeksportować żadnej warstwy.")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Błąd", str(e))
+            self.status.clearMessage()
+
+    def open_web_map_url_action(self):
+        """Otwiera localhost w domyślnej przeglądarce."""
+        url = "http://localhost:8000/index.html"
+        
+        # Sprawdzamy czy plik w ogóle istnieje
+        index_path = os.path.join(self.data_dir, "index.html")
+        if not os.path.exists(index_path):
+            QtWidgets.QMessageBox.warning(self, "Brak mapy", "Najpierw kliknij 'Aktualizuj treść mapy', aby wygenerować plik.")
+            return
+
+        import webbrowser
+        webbrowser.open(url)
     def publish_current_postgis_layer_action(self):
         try:
             from core.geoserver_publish import GeoServerPublisher
