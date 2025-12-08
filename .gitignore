@@ -14,6 +14,9 @@ dane/*.gpkg
 dane/*.dbf
 dane/*.laz
 dane/*.las
+dane/*.asc
+dane/*.gfs
+dane/*
 
 *.qgis
 *.qgz
