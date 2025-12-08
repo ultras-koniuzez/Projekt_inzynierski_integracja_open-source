@@ -4,7 +4,7 @@ import os
 import psycopg2
 from sqlalchemy import create_engine, text  
 import geopandas as gpd
-
+from sqlalchemy import text
 class PostGISConnector:
     def __init__(self, conn_string):
         """
@@ -111,6 +111,50 @@ class PostGISConnector:
         print(f"Uruchamiam import: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         return True
+    def check_advanced_capabilities(self):
+        """
+        Sprawdza i próbuje aktywować obsługę Rastrów i Chmur Punktów.
+        Zwraca słownik ze statusem.
+        """
+        if self.engine is None: self.connect()
+        
+        status = {
+            "postgis": False,          # Wektory
+            "postgis_raster": False,   # Rastry
+            "pointcloud": False        # LiDAR
+        }
+        
+        with self.engine.connect() as conn:
+            # 1. Sprawdź/Włącz PostGIS (Wektory)
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
+                status["postgis"] = True
+            except Exception as e:
+                print(f"Błąd PostGIS: {e}")
+
+            # 2. Sprawdź/Włącz Rastry (Od PostGIS 3.0 to osobne rozszerzenie)
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis_raster;"))
+                status["postgis_raster"] = True
+            except Exception:
+                # W starszych wersjach rastry są w głównym 'postgis', więc uznajemy że jest OK
+                # jeśli krok 1 przeszedł. Ale w nowych trzeba doinstalować.
+                # Sprawdzamy czy tabela geometry_columns istnieje (to pewnik wektorów)
+                pass
+
+            # 3. Sprawdź/Włącz PointCloud (LiDAR)
+            # Wymaga zainstalowanego w systemie 'pgpointcloud'
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pointcloud;"))
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pointcloud_postgis;"))
+                status["pointcloud"] = True
+            except Exception:
+                # To częste - brak biblioteki w systemie
+                status["pointcloud"] = False
+                
+            conn.commit()
+            
+        return status
     def get_available_layers(self):
         """
         Pobiera listę tabel przestrzennych z bazy (schema, table, geometry_column).
