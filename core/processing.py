@@ -223,3 +223,82 @@ def pdal_generate_dtm(las_path, out_tif, resolution=1.0):
         }
     ]
     _run_pdal_pipeline(pipeline)
+def extract_by_attribute(src_path, out_path, column, value):
+    """
+    Filtruje warstwę wektorową (np. wybiera jedną dzielnicę).
+    """
+    if not gpd: raise ImportError("Brak GeoPandas")
+    
+    print(f"[GeoPandas] Wyodrębnianie: {column} = {value}...")
+    
+    try:
+        gdf = gpd.read_file(src_path)
+        
+        # Sprawdzenie typu danych (czy wartość to liczba czy tekst)
+        # GeoPandas wczytuje typy, ale musimy upewnić się, że porównujemy jabłka z jabłkami
+        if gdf[column].dtype == 'object':
+            value = str(value)
+        else:
+            try:
+                value = float(value)
+            except: pass # Zostawiamy jak jest
+            
+        # FILTROWANIE
+        filtered_gdf = gdf[gdf[column] == value]
+        
+        if len(filtered_gdf) == 0:
+            raise ValueError(f"Brak obiektów spełniających warunek {column}={value}")
+            
+        filtered_gdf.to_file(out_path)
+        print(f"✅ Zapisano {len(filtered_gdf)} obiektów do: {out_path}")
+        
+    except Exception as e:
+        print(f"❌ Błąd ekstrakcji: {e}")
+        raise e
+def validate_geometry(src_path):
+    """
+    Sprawdza poprawność topologiczną warstwy (QA/QC).
+    Wymóg dla Mapy Numerycznej: Obiekty muszą być 'Valid'.
+    Zwraca raport tekstowy.
+    """
+    if not gpd: return "Brak biblioteki GeoPandas."
+    
+    print(f"Walidacja geometrii: {src_path}")
+    try:
+        gdf = gpd.read_file(src_path)
+        total = len(gdf)
+        
+        # Sprawdzenie poprawności (is_valid)
+        # To funkcja silnika GEOS - bardzo szybka i dokładna
+        invalid_mask = ~gdf.is_valid
+        invalid_rows = gdf[invalid_mask]
+        count_invalid = len(invalid_rows)
+        
+        report = f"--- RAPORT WALIDACJI ---\n"
+        report += f"Plik: {os.path.basename(src_path)}\n"
+        report += f"Liczba obiektów: {total}\n"
+        report += f"Poprawne: {total - count_invalid}\n"
+        report += f"Błędne: {count_invalid}\n"
+        report += "-" * 30 + "\n"
+        
+        if count_invalid > 0:
+            report += "SZCZEGÓŁY BŁĘDÓW:\n"
+            # Wyciągamy powód błędu
+            # (Shapely posiada explain_validity, ale w pandas używamy apply)
+            from shapely.validation import explain_validity
+            
+            for idx, row in invalid_rows.iterrows():
+                reason = explain_validity(row.geometry)
+                report += f"ID {idx}: {reason}\n"
+                if idx > 10: # Ograniczamy raport
+                    report += "... i więcej ...\n"
+                    break
+            
+            report += "\nZALECENIE: Użyj funkcji 'Napraw Geometrię' (buffer 0) w QGIS."
+        else:
+            report += "✅ WARSTWA POPRAWNA TOPOLOGICZNIE.\nMożna użyć do Mapy Numerycznej."
+            
+        return report
+
+    except Exception as e:
+        return f"Błąd walidacji: {e}"
