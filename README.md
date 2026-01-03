@@ -6,16 +6,21 @@ Repozytorium zawiera eksperymentalną, modułową architekturę systemu GIS prze
 Projekt koncentruje się przede wszystkim na **możliwościach integracyjnych**, **charakterystyce wydajnościowej** oraz **elastyczności łączenia narzędzi niskopoziomowych z bibliotekami wysokiego poziomu**, a nie na bezwzględnej dokładności produktów kartograficznych.
 
 Architektura łączy środowisko GIS desktop, programistyczne przetwarzanie danych, przestrzenną bazę danych, usługi sieciowe oraz wizualizację 3D w środowisku desktopowym i webowym.
-
+--------------------------------------------
+Aby aplikacja integracji działała, należy zainstalować programy:
+- QGIS
+- OsGeo4w
+- Geoserver
+- PostgreSQL z rozszerzeniem PostGIS
 W celu inicjalizacji aplikacji należy otworzyć wiersz poleceń (CMD) oraz stosując komendy 'cd' dotrzeć do ścieżki folderu głównego pobranego programu
 Aby uruchomić plikację okienkową należy sprawdzić folder, w którym zlokalizowany jest QGIS oraz jaką wersją dysponujemy, po czym podmienić tę ścieżki w plikach: 
-    - run.bat
-    - app.py
+- run.bat
+- app.py
 Aby połączyć się do bazy danych poprzez button w aplikacji w pliku .env, należy ustawić zmienne środowiskowe do pobierania 
 Jeśli aplikacja nie startuje należy w tym samym folderze uruchomić polecenie:
-    - instalacja_bibliotek.bat 
+- instalacja_bibliotek.bat 
 Gdzie znajdują się wszystkie potrzebne biblioteki do użytkowania aplikacji.
----
+-------------------------------------------
 
 ## 🎯 Cele projektu
 
