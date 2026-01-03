@@ -157,16 +157,21 @@ class PostGISConnector:
         return status
     def get_available_layers(self):
         """
-        Pobiera listę tabel przestrzennych z bazy (schema, table, geometry_column).
+        Pobiera listę tabel Wektorowych i Rastrowych.
+        Zwraca: (schema, table, column, srid, type)
         """
-        if self.engine is None:
-            self.connect()
-            
-        # Zapytanie do widoku systemowego PostGIS
+        if self.engine is None: self.connect()
+        
+        from sqlalchemy import text
+        # Łączymy wektory i rastry w jedną listę
         sql = text("""
-            SELECT f_table_schema, f_table_name, f_geometry_column, srid 
+            SELECT f_table_schema, f_table_name, f_geometry_column, srid, 'VEK' as type 
             FROM geometry_columns 
-            ORDER BY f_table_schema, f_table_name
+            WHERE f_table_schema != 'topology'
+            UNION ALL
+            SELECT r_table_schema, r_table_name, r_raster_column, srid, 'RAST' as type 
+            FROM raster_columns
+            ORDER BY 1, 2
         """)
         
         layers = []
@@ -174,11 +179,10 @@ class PostGISConnector:
             with self.engine.connect() as conn:
                 result = conn.execute(sql)
                 for row in result:
-                    # Zwracamy krotkę: (schema, table, geom_col, srid)
                     layers.append(row)
             return layers
         except Exception as e:
-            print(f"Błąd pobierania listy warstw: {e}")
+            print(f"Błąd pobierania warstw: {e}")
             return []
     # ---- Metoda B: użycie GeoPandas (Python) ----
     def import_with_geopandas(self, layer_path, table_name=None, if_exists="replace"):

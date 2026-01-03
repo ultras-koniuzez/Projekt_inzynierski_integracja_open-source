@@ -4,7 +4,6 @@ import subprocess
 from osgeo import gdal, ogr, osr
 import json
 
-# Biblioteki Pythonowe (opcjonalne)
 try:
     import rasterio
     import geopandas as gpd
@@ -15,16 +14,11 @@ except ImportError:
 gdal.UseExceptions()
 
 # =============================================================================
-# SEKCJA 1: ANALIZY RASTROWE (GDAL)
+#  ANALIZY RASTROWE (GDAL)
 # =============================================================================
 
 def compute_slope_raster(src_path, out_path, z_factor=1.0):
-    """
-    Oblicza nachylenie.
-    z_factor: Mnożnik wysokości.
-              Dla układów metrycznych (PUWG) = 1.0
-              Dla WGS84 (stopnie) ~= 111120.0
-    """
+
     print(f"[GDAL] Slope (Z-Factor={z_factor})...")
     try:
         options = gdal.DEMProcessingOptions(
@@ -40,7 +34,7 @@ def compute_slope_raster(src_path, out_path, z_factor=1.0):
         raise e
 
 def compute_aspect_raster(src_path, out_path, z_factor=1.0):
-    """Oblicza ekspozycję."""
+
     print(f"[GDAL] Aspect (Z-Factor={z_factor})...")
     try:
         options = gdal.DEMProcessingOptions(
@@ -55,11 +49,7 @@ def compute_aspect_raster(src_path, out_path, z_factor=1.0):
         raise e
 
 def compute_hillshade_raster(src_path, out_path, z_factor=1.0, az=315.0, alt=45.0):
-    """
-    Cieniowanie z parametrami słońca.
-    az: Azymut słońca (domyślnie 315 - NW)
-    alt: Wysokość słońca (domyślnie 45 stopni)
-    """
+
     print(f"[GDAL] Hillshade (Z={z_factor}, Az={az}, Alt={alt})...")
     try:
         options = gdal.DEMProcessingOptions(
@@ -76,7 +66,7 @@ def compute_hillshade_raster(src_path, out_path, z_factor=1.0, az=315.0, alt=45.
         raise e
 
 # =============================================================================
-# SEKCJA 2: ANALIZY WEKTOROWE
+#  ANALIZY WEKTOROWE
 # =============================================================================
 
 def generate_contours(src_path, out_path, interval=10.0, attr_name="ELEV"):
@@ -86,8 +76,7 @@ def generate_contours(src_path, out_path, interval=10.0, attr_name="ELEV"):
     try:
         ds = gdal.Open(src_path)
         band = ds.GetRasterBand(1)
-        
-        # NoData logic
+
         no_data_val = band.GetNoDataValue()
         has_no_data = 1 if no_data_val is not None else 0
         if not has_no_data: no_data_val = 0.0
@@ -96,7 +85,6 @@ def generate_contours(src_path, out_path, interval=10.0, attr_name="ELEV"):
         proj = ds.GetProjection()
         if proj: srs.ImportFromWkt(proj)
 
-        # Driver selection
         driver_name = "GPKG" if out_path.lower().endswith(".gpkg") else "ESRI Shapefile"
         drv = ogr.GetDriverByName(driver_name)
         
@@ -121,9 +109,7 @@ def generate_contours(src_path, out_path, interval=10.0, attr_name="ELEV"):
 
 def vector_buffer(src_path, out_path, distance):
     print(f"[OGR] Bufor {distance}m...")
-    # ... (Kod bufora bez zmian - jest poprawny) ...
-    # Skopiuj implementację z poprzedniego pliku lub zostaw, jeśli masz kopię
-    # Wklejam skróconą wersję dla pewności:
+
     src_ds = ogr.Open(src_path)
     layer = src_ds.GetLayer()
     driver = ogr.GetDriverByName("ESRI Shapefile")
@@ -143,13 +129,26 @@ def vector_buffer(src_path, out_path, distance):
     out_ds = None
 
 def clip_vector_geopandas(src_path, mask_path, out_path):
-    if not gpd: raise ImportError("Brak GeoPandas")
-    print("[GeoPandas] Clip...")
+    import geopandas as gpd
+
     gdf = gpd.read_file(src_path)
     mask = gpd.read_file(mask_path)
-    if gdf.crs != mask.crs: mask = mask.to_crs(gdf.crs)
+    
+    if gdf.empty or mask.empty:
+        print("Błąd: Jedna z warstw jest pusta.")
+        return
+    if gdf.crs != mask.crs:
+        print(f"Transformacja CRS maski do układu punktów: {gdf.crs}")
+        mask = mask.to_crs(gdf.crs)
+
     clipped = gpd.clip(gdf, mask)
-    clipped.to_file(out_path)
+
+    if not clipped.empty:
+        clipped.to_file(out_path)
+        print(f"Sukces! Wycięto {len(clipped)} obiektów.")
+    else:
+        print("Wynik przycinania jest pusty - sprawdź czy warstwy są spójne przestrzennie.")
+        clipped.to_file(out_path)
 
 def centroids_geopandas(src_path, out_path):
     if not gpd: raise ImportError("Brak GeoPandas")
@@ -159,18 +158,14 @@ def centroids_geopandas(src_path, out_path):
     gdf.to_file(out_path)
     
 def pdal_info(las_path):
-    """
-    Pobiera pełne statystyki pliku LAS (skanuje punkty, żeby mieć pewne min/max).
-    """
+
     print(f"[PDAL] Info (skanowanie punktów): {las_path}")
-    # ZMIANA: Używamy --stats zamiast --summary. 
-    # To trwa chwilę dłużej, ale gwarantuje poprawne współrzędne nawet przy zepsutym nagłówku.
+
     cmd = ["pdal", "info", las_path, "--stats"]
     
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     
-    # Uruchamiamy proces
     result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=si)
     
     if result.returncode != 0:
@@ -191,7 +186,7 @@ def _run_pdal_pipeline(pipeline_json):
         if os.path.exists(tmp_path): os.remove(tmp_path)
 
 def pdal_generate_dsm(las_path, out_tif, resolution=1.0):
-    """Generuje DSM (Max Z)."""
+
     print(f"[PDAL] Generowanie DSM...")
     pipeline = [
         {"type": "readers.las", "filename": las_path},
@@ -201,75 +196,102 @@ def pdal_generate_dsm(las_path, out_tif, resolution=1.0):
             "resolution": resolution,
             "output_type": "max",
             "data_type": "float32",
-            "gdalopts": "COMPRESS=DEFLATE"
+            "gdalopts": "COMPRESS=DEFLATE, PREDICTOR=2"
         }
     ]
     _run_pdal_pipeline(pipeline)
 
 def pdal_generate_dtm(las_path, out_tif, resolution=1.0):
-    """Generuje DTM (Ground Filter)."""
-    print(f"[PDAL] Generowanie DTM...")
+
+    print(f"[PDAL] Generowanie ciągłego modelu DTM...")
     pipeline = [
         {"type": "readers.las", "filename": las_path},
+
         {"type": "filters.smrf", "ignore": "Classification[7:7]"},
+
         {"type": "filters.range", "limits": "Classification[2:2]"},
+
         {
             "type": "writers.gdal",
             "filename": out_tif,
             "resolution": resolution,
-            "output_type": "mean",
+            "output_type": "idw",      
+            "window_size": 3,          
+            "radius": 15.0,            
             "data_type": "float32",
-            "gdalopts": "COMPRESS=DEFLATE"
+            "nodata": -9999,
+            "gdalopts": "COMPRESS=DEFLATE,PREDICTOR=2"
         }
     ]
     _run_pdal_pipeline(pipeline)
 def extract_by_attribute(src_path, out_path, column, value):
-    """
-    Filtruje warstwę wektorową (np. wybiera jedną dzielnicę).
-    """
-    if not gpd: raise ImportError("Brak GeoPandas")
-    
-    print(f"[GeoPandas] Wyodrębnianie: {column} = {value}...")
-    
+
+    if not gpd:
+        raise ImportError("Brak GeoPandas")
+
+    print(f"[GeoPandas] Wyodrębnianie: {column} {value}...")
     try:
         gdf = gpd.read_file(src_path)
-        
-        # Sprawdzenie typu danych (czy wartość to liczba czy tekst)
-        # GeoPandas wczytuje typy, ale musimy upewnić się, że porównujemy jabłka z jabłkami
-        if gdf[column].dtype == 'object':
-            value = str(value)
+
+        expr = str(value).strip()
+        op = "=="
+        raw = expr
+
+        for possible in (">=", "<=", ">", "<"):
+            if expr.startswith(possible):
+                op = possible
+                raw = expr[len(possible):].strip()
+                break
+
+        series = gdf[column]
+        if series.dtype == "object":
+
+            if op != "==":
+                raise ValueError(
+                    f"Kolumna '{column}' jest tekstowa – obsługuję tylko porównanie równości."
+                )
+            val = raw
+            mask = series.astype(str) == val
         else:
+
             try:
-                value = float(value)
-            except: pass # Zostawiamy jak jest
-            
-        # FILTROWANIE
-        filtered_gdf = gdf[gdf[column] == value]
-        
+                val = float(raw)
+            except Exception:
+                raise ValueError(f"Nieprawidłowa wartość liczbową w wyrażeniu: {expr}")
+
+            if op == "==":
+                mask = series == val
+            elif op == ">":
+                mask = series > val
+            elif op == "<":
+                mask = series < val
+            elif op == ">=":
+                mask = series >= val
+            elif op == "<=":
+                mask = series <= val
+            else:
+                mask = series == val
+
+        filtered_gdf = gdf[mask]
+
         if len(filtered_gdf) == 0:
-            raise ValueError(f"Brak obiektów spełniających warunek {column}={value}")
-            
+            raise ValueError(f"Brak obiektów spełniających warunek {column} {expr}")
+
         filtered_gdf.to_file(out_path)
         print(f"✅ Zapisano {len(filtered_gdf)} obiektów do: {out_path}")
-        
+
     except Exception as e:
         print(f"❌ Błąd ekstrakcji: {e}")
         raise e
 def validate_geometry(src_path):
-    """
-    Sprawdza poprawność topologiczną warstwy (QA/QC).
-    Wymóg dla Mapy Numerycznej: Obiekty muszą być 'Valid'.
-    Zwraca raport tekstowy.
-    """
+
     if not gpd: return "Brak biblioteki GeoPandas."
     
     print(f"Walidacja geometrii: {src_path}")
     try:
         gdf = gpd.read_file(src_path)
         total = len(gdf)
-        
-        # Sprawdzenie poprawności (is_valid)
-        # To funkcja silnika GEOS - bardzo szybka i dokładna
+
         invalid_mask = ~gdf.is_valid
         invalid_rows = gdf[invalid_mask]
         count_invalid = len(invalid_rows)
@@ -283,8 +305,7 @@ def validate_geometry(src_path):
         
         if count_invalid > 0:
             report += "SZCZEGÓŁY BŁĘDÓW:\n"
-            # Wyciągamy powód błędu
-            # (Shapely posiada explain_validity, ale w pandas używamy apply)
+
             from shapely.validation import explain_validity
             
             for idx, row in invalid_rows.iterrows():
@@ -302,3 +323,63 @@ def validate_geometry(src_path):
 
     except Exception as e:
         return f"Błąd walidacji: {e}"
+def clip_raster_gdal(src_raster_path, mask_vector_path, out_tif_path):
+
+    print(f"[GDAL] Przycinanie rastra do maski: {mask_vector_path}")
+    
+    try:
+
+        options = gdal.WarpOptions(
+            
+            format="GTiff",
+            cutlineDSName=mask_vector_path,
+            cropToCutline=True,
+            dstAlpha=True 
+        )
+
+        gdal.Warp(out_tif_path, src_raster_path, options=options)
+        print(f"✅ Przycięto raster: {out_tif_path}")
+        
+    except RuntimeError as e:
+        print(f"❌ Błąd GDAL Clip: {e}")
+        raise e
+def polygon_to_line(src_path, out_path):
+
+    if not gpd: raise ImportError("Brak biblioteki GeoPandas.")
+    
+    print(f"[GeoPandas] Konwersja Poligon -> Linia: {src_path}")
+    
+    try:
+        gdf = gpd.read_file(src_path)
+
+        if not any(gdf.geom_type.isin(['Polygon', 'MultiPolygon'])):
+            print("Ostrzeżenie: Warstwa może nie zawierać poligonów.")
+
+        gdf['geometry'] = gdf.geometry.boundary
+        
+        # Zapis
+        gdf.to_file(out_path)
+        print(f"✅ Zapisano linie: {out_path}")
+        
+    except Exception as e:
+        print(f"❌ Błąd konwersji: {e}")
+        raise e
+def convert_raster_to_jpg(src_path, out_path):
+
+    print(f"[GDAL] Konwersja do JPG: {src_path}")
+    
+    try:
+
+        options = gdal.TranslateOptions(
+            format="JPEG",
+            outputType=gdal.GDT_Byte,
+            scaleParams=[[]], 
+            creationOptions=["WORLDFILE=YES", "QUALITY=95"] 
+        )
+        
+        gdal.Translate(out_path, src_path, options=options)
+        print(f"✅ Utworzono JPG: {out_path}")
+        
+    except Exception as e:
+        print(f"❌ Błąd konwersji JPG: {e}")
+        raise e

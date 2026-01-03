@@ -29,7 +29,7 @@ from qgis.PyQt.QtXml import QDomDocument
 from qgis.PyQt import QtGui, QtWidgets
 
 # =============================================================================
-# SEKCJA 1: STYLIZACJA
+# STYLIZACJA
 # =============================================================================
 
 def apply_basic_style(vlayer, color_name="black", width=0.4):
@@ -42,7 +42,37 @@ def apply_basic_style(vlayer, color_name="black", width=0.4):
         vlayer.setRenderer(QgsSingleSymbolRenderer(symbol))
         vlayer.triggerRepaint()
     except: pass
+def set_transparent_fill(vlayer, outline_color="red", width=0.5):
 
+    if not vlayer.isValid(): return
+
+    if vlayer.geometryType() != 2:
+        print("To nie jest warstwa poligonowa (nie można usunąć wypełnienia).")
+        return
+
+    try:
+        from qgis.core import QgsSymbol, QgsSingleSymbolRenderer
+        from qgis.PyQt import QtGui, QtCore
+        
+
+        symbol = QgsSymbol.defaultSymbol(vlayer.geometryType())
+
+        if symbol.symbolLayerCount() > 0:
+            layer_style = symbol.symbolLayer(0)
+            
+            layer_style.setBrushStyle(QtCore.Qt.NoBrush)
+            
+            layer_style.setStrokeColor(QtGui.QColor(outline_color))
+            layer_style.setStrokeWidth(width)
+
+        renderer = QgsSingleSymbolRenderer(symbol)
+        vlayer.setRenderer(renderer)
+        vlayer.triggerRepaint()
+        print(f"Zastosowano styl: Obrys ({outline_color})")
+        
+    except Exception as e:
+        print(f"Błąd stylizacji: {e}")
+        
 def apply_raster_colormap(rlayer, ramp_name="Spectral", invert=False):
     if not rlayer.isValid(): return
     provider = rlayer.dataProvider()
@@ -73,7 +103,7 @@ def apply_raster_colormap(rlayer, ramp_name="Spectral", invert=False):
     except: pass
 
 # =============================================================================
-# SEKCJA 2: NARZĘDZIA MAPY
+# NARZĘDZIA MAPY
 # =============================================================================
 
 def calculate_nice_interval(width_in_units, is_geographic):
@@ -98,14 +128,14 @@ def heuristic_fix_crs(extent, current_crs):
     return current_crs
 
 def ensure_metadata_label(layout, text):
-    """Tworzy metrykę TYLKO jeśli w szablonie jej brak."""
+
     item = layout.itemById('meta_label')
     if not item:
         for i in layout.items():
             if isinstance(i, QgsLayoutItemLabel) and "{AUTOR}" in i.text():
                 item = i; break
     if not item:
-        # Tworzymy nową w bezpiecznym miejscu, jeśli szablon jest pusty
+
         item = QgsLayoutItemLabel(layout)
         item.setId("meta_label")
         layout.addLayoutItem(item)
@@ -128,9 +158,9 @@ def safe_set_text(layout, item_id, text):
 
 def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs):
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    template_path = os.path.join(base_dir, "template2.qpt") 
+    template_path = os.path.join(base_dir, "template.qpt") 
     if not os.path.exists(template_path): 
-        template_path = os.path.join(base_dir, "template.qpt")
+        template_path = os.path.join(base_dir, "template2.qpt")
         if not os.path.exists(template_path): raise FileNotFoundError("Brak szablonu")
     QtWidgets.QApplication.processEvents()
     layout = QgsLayout(project)
@@ -139,8 +169,7 @@ def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs)
         doc = QDomDocument(); doc.setContent(f.read())
     layout.loadFromTemplate(doc, QgsReadWriteContext())
 
-    
-    # --- 1. MAPA ---
+
     map_item = layout.itemById('main_map')
     
     if map_item and isinstance(map_item, QgsLayoutItemMap):
@@ -153,7 +182,6 @@ def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs)
         final_crs = target_crs
         final_extent = canvas_extent
 
-        # Bezpieczna transformacja
         if canvas_crs != target_crs:
             try:
                 tr = QgsCoordinateTransform(canvas_crs, target_crs, QgsProject.instance())
@@ -170,8 +198,7 @@ def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs)
 
         map_item.setCrs(final_crs)
         map_item.zoomToExtent(final_extent)
-        
-        # --- 2. SIATKA ---
+
         grids = map_item.grids()
         while grids.size() > 0: grids.removeGrid(grids.grid(0).id())
         grid = QgsLayoutItemMapGrid("Grid", map_item)
@@ -189,7 +216,7 @@ def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs)
         grid.setAnnotationEnabled(True)
         for s in [0,1,2,3]: grid.setAnnotationDisplay(0, s)
         
-        sym = QgsLineSymbol.createSimple({'color': 'black', 'width': '0.1'})
+        sym = QgsLineSymbol.createSimple({'color': 'white', 'width': '0.01'})
         grid.setLineSymbol(sym)
         grid.setStyle(0)
         grid.setFrameStyle(1)
@@ -200,13 +227,11 @@ def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs)
         map_item.updateBoundingRect()
         map_item.refresh()
 
-        # --- 3. TEKSTY ---
         safe_set_text(layout, 'title_label', title_text)
         crs_desc = f"{final_crs.authid()} - {final_crs.description()}"
-        meta = f"PROJEKT\nAutor: {author}\nData: {datetime.now().strftime('%Y-%m-%d')}\nUkład: {crs_desc}\nŹródło: GUGiK/OSM"
+        meta = f"Autor: {author}\nData: {datetime.now().strftime('%Y-%m-%d')}\nUkład: {crs_desc}"
         ensure_metadata_label(layout, meta)
 
-        # --- 4. SKALA  ---
         scalebars = [i for i in layout.items() if isinstance(i, QgsLayoutItemScaleBar)]
         if scalebars:
             sb = scalebars[0]
@@ -218,10 +243,9 @@ def export_map_to_pdf(project, canvas, out_path, title_text, author, target_crs)
 
             sb.update()
 
-    # --- 5. EKSPORT ---
     exporter = QgsLayoutExporter(layout)
     settings = QgsLayoutExporter.PdfExportSettings()
-    settings.dpi = 210
+    settings.dpi = 220
     settings.rasterizeWholeImage = True
     res = exporter.exportToPdf(out_path, settings)
     

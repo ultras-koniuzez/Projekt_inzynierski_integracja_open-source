@@ -8,15 +8,6 @@ __pycache__/
 .env
 config.ini
 
-dane/*.tif
-dane/*.shp 
-dane/*.gpkg
-dane/*.dbf
-dane/*.laz
-dane/*.las
-dane/*.asc
-dane/*.gfs
-dane/*
 
 *.qgis
 *.qgz
