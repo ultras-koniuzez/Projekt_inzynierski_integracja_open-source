@@ -8,10 +8,10 @@ Projekt koncentruje się przede wszystkim na **możliwościach integracyjnych**,
 Architektura łączy środowisko GIS desktop, programistyczne przetwarzanie danych, przestrzenną bazę danych, usługi sieciowe oraz wizualizację 3D w środowisku desktopowym i webowym.
 --------------------------------------------
 Aby aplikacja integracji działała, należy zainstalować programy:
-- QGIS
-- OsGeo4w
-- Geoserver
-- PostgreSQL z rozszerzeniem PostGIS
+- QGIS,
+- OsGeo4w,
+- Geoserver,
+- PostgreSQL z rozszerzeniem PostGIS,
 W celu inicjalizacji aplikacji należy otworzyć wiersz poleceń (CMD) oraz stosując komendy 'cd' dotrzeć do ścieżki folderu głównego pobranego programu
 Aby uruchomić plikację okienkową należy sprawdzić folder, w którym zlokalizowany jest QGIS oraz jaką wersją dysponujemy, po czym podmienić tę ścieżki w plikach: 
 - run.bat
